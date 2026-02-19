@@ -1,0 +1,283 @@
+---
+title: "Analyse de survie - Cancer du sein (TCGA-BRCA)"
+author: "Rebecca Boizo"
+date: "`r Sys.Date()`"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r installation}
+install.packages(c("survival", "survminer", "glmnet", "dplyr", "ggplot2"))
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("TCGAbiolinks")
+```
+
+```{r libraries}
+library(TCGAbiolinks)
+library(survival)
+library(survminer)
+library(glmnet)
+library(dplyr)
+library(ggplot2)
+```
+
+```{r importation du dataset}
+query <- GDCquery(
+  project = "TCGA-BRCA",
+  data.category = "Clinical",
+  data.type = "Clinical Supplement",
+  data.format = "BCR Biotab"
+)
+
+GDCdownload(query)
+clinical <- GDCprepare(query)
+```
+
+```{r exploration du dataset}
+names(clinical)
+```
+
+## Identification des variables d'intérêt
+
+On s'intéresse maintenant au contenu de chaque table afin d'identifier nos variables d'intérêt.
+
+```{r exploration_tables}
+# Regarder le contenu de chaque table
+lapply(clinical, names)
+```
+
+Après exploration des 9 tables disponibles, nous avons retenu la table clinical_patient_brca pour notre analyse car elle contient les variables essentielles à l'analyse de survie comme vital_status et death_days_to : pour construire la variable de survie.
+
+```{r creation du dataset patient avec la table choisie}
+# Table principale des patientes
+patient <- clinical[["clinical_patient_brca"]]
+
+# Dimensions
+dim(patient)
+```
+
+```{r effectif du dataset}
+
+table(patient$gender)
+prop.table(table(patient$gender)) * 100
+table(patient$vital_status)
+table(patient$gender ,patient$vital_status)
+head(patient)
+
+
+```
+
+## Contenu du dataset
+
+La cohorte TCGA-BRCA est constituée quasi exclusivement de femmes, avec 1085 patientes soit 98.7% contre seulement 12 hommes soit 1.1%, ce qui est cohérent avec la réalité épidémiologique : le cancer du sein est une pathologie qui touche majoritairement les femmes.Parmi les femmes, 981 sont encore en vie soit 90.5% et 104 sont décédées soit 9.5% au moment du dernier contact. Du côté des hommes, les 12 patients sont tous en vie, aucun décès n'est enregistré dans cette cohorte.Compte tenu du déséquilibre extrême entre les sexes soit 98.7% de femmes et de l'absence de décès chez les hommes, la variable gender ne sera pas incluse comme covariable dans les modèles de survie. Son pouvoir discriminant est nul et son inclusion pourrait introduire un biais dans les estimations. L'analyse portera donc exclusivement sur la population féminine.
+
+```{r preparation des donnees}
+# On garde les variables utiles
+df1 <- select(patient, 
+              bcr_patient_barcode, vital_status, death_days_to,
+              last_contact_days_to, age_at_diagnosis,
+              ajcc_pathologic_tumor_stage, er_status_by_ihc,
+              her2_status_by_ihc, pr_status_by_ihc, race,tumor_status,menopause_status)
+df2 <- mutate(df1,
+              status = ifelse(vital_status == "Dead", 1, 0),
+              time   = ifelse(vital_status == "Dead",
+                              as.numeric(death_days_to),
+                              as.numeric(last_contact_days_to)))
+
+df <- filter(df2, !is.na(time), time > 0)
+dim(df)
+head(df)
+```
+
+```{r }
+# Répartition vivantes/décédées
+table(df$vital_status)
+
+# Résumé du temps de survie
+summary(df$time)
+
+# Convertion du  temps en mois
+df$time_months <- df$time/30.4
+
+summary(df$time_months)
+```
+
+## Exploration des données de survie
+
+La table de répartition montre 932 patientes censurées et 103 décès. Le taux d'événements est de 10%, ce qui est cohérent avec le bon pronostic général du cancer du sein.
+
+Le temps de suivi varie de 1 à 7067 jours. La médiane est de 463 jours alors que la moyenne est de 853 jours, cet écart indique que quelques patientes avec un très long suivi tirent la moyenne vers le haut.
+
+## Analyse de survie avec les courbes de Kaplan-Meier
+
+Maintenant que nos variables de survie sont construites, nous allons visualiser la survie des patientes à l'aide des courbes de Kaplan-Meier dans le soucis de repondre a la proble;atiaue suivante : quelle est la probabilité qu'une patiente soit encore en vie après X mois ?
+
+```{r courbe km }
+library(survival)
+library(survminer)
+
+surv_obj <- Surv(time = df$time_months, event = df$status)
+km_global <- survfit(surv_obj ~ 1, data = df)
+
+#Courbe de km 
+ggsurvplot(
+  km_global,
+  data = df,
+  title = "Survie globale du Cancer du sein",
+  xlab = "Temps en mois",
+  ylab = "Probabilité de survie",
+  palette = "pink",
+  ggtheme = theme_minimal()
+)
+```
+
+## Courbe de Kaplan-Meier globale
+
+La courbe de survie globale montre que la probabilité de survie des patientes atteintes d'un cancer du sein reste élevée sur les premières années. On observe qu'à 125 mois envirron 10 ans, 50% des patientes sont encore en vie c'est la médiane de survie.
+
+La courbe descend progressivement sans chute brutale, ce qui reflète le bon pronostic général du cancer du sein comparé à d'autres cancers.
+
+Les croix (+) sur la courbe représentent les patientes censurées, c'est-à-dire les patientes encore vivantes au moment de leur dernier contact. de la courbe en fin de suivi.
+
+La comparaison des courbes de Kaplan-Meier par stade tumoral confirme l'hypothèse clinique : plus le stade est avancé, moins bonne est la survie. Nous allons maintennat étudier les facteurs qui impactent la survie des patientes.
+
+## Facteur âge
+
+```{r facteurs_age}
+df_age <- mutate(df, status = ifelse(vital_status == "Dead", 1, 0),
+    time_months = ifelse(vital_status == "Dead", as.numeric(death_days_to), as.numeric(last_contact_days_to)) /30.4,
+    age_groupe = ifelse(as.numeric(age_at_diagnosis) < 50,"< 50 ans", ">= 50 ans"))
+
+df_age_1 <-  filter(df_age, !is.na(time_months), time_months > 0, !is.na(age_groupe))
+
+km_age <- survfit(Surv(time_months, status) ~ age_groupe, data = df_age_1)
+
+ggsurvplot(km_age, data = df_age_1,
+           xlab = "Temps en mois", ylab = "Probabilité de survie",
+           pval = TRUE,
+           palette = c("blue", "red"),
+           legend.labs = c("< 50 ans", ">= 50 ans"),
+           ggtheme = theme_minimal())
+```
+
+Les patientes de moins de 50 ans ont une meilleure survie que celles de 50 ans et plus. Ce résultat peut sembler contre-intuitif, on s'attendrait à ce que les jeunes survivent mieux mais il s'explique par le fait que les cancers du sein diagnostiqués jeunes sont souvent plus agressifs biologiquement (tumeurs triple négatives, HER2+).
+
+## Facteur stade tumoral
+
+```{r facteurs_stade}
+df_stade <- mutate(df,
+  stade_groupe = case_when(
+    grepl("Stage I",   ajcc_pathologic_tumor_stage) & !grepl("II|III|IV", ajcc_pathologic_tumor_stage) ~ "I",
+    grepl("Stage II",  ajcc_pathologic_tumor_stage) ~ "II",
+    grepl("Stage III", ajcc_pathologic_tumor_stage) ~ "III",
+    grepl("Stage IV",  ajcc_pathologic_tumor_stage) ~ "IV",
+    TRUE ~ NA_character_
+  ))
+
+df_stade_1 <- filter(df_stade, !is.na(stade_groupe))
+
+km_stade <- survfit(Surv(time_months, status) ~ stade_groupe, data = df_stade_1)
+
+ggsurvplot(km_stade, data = df_stade_1,
+           xlab = "Temps en mois", ylab = "Probabilité de survie",
+           pval = TRUE,
+           ggtheme = theme_minimal())
+```
+
+La différence de survie entre les stades est nette et statistiquement significative (p \< 0.0001). Les patientes au stade IV ont une survie qui chute rapidement dès les premières années, tandis que les stades I et II maintiennent une probabilité de survie élevée sur le long terme. Ce résultat confirme que le stade au diagnostic est un facteur pronostique majeur.
+
+## Facteur race
+
+```{r facteurs_race}
+df_race <- mutate(df,
+  status = ifelse(vital_status == "Dead", 1, 0),
+  time_months = ifelse(vital_status == "Dead",
+                       as.numeric(death_days_to),
+                       as.numeric(last_contact_days_to)) / 30.4,
+  race_groupe = case_when(
+    race %in% c("[Not Available]", "[Not Evaluated]", "[Unknown]") ~ NA_character_,
+    TRUE ~ race
+  ))
+
+df_race_1 <- filter(df_race, !is.na(time_months), time_months > 0, !is.na(race_groupe))
+
+km_race <- survfit(Surv(time_months, status) ~ race_groupe, data = df_race_1)
+
+ggsurvplot(km_race, data = df_race_1,
+           xlab = "Temps en mois", ylab = "Probabilité de survie",
+           pval = TRUE,
+           ggtheme = theme_minimal(),
+           legend.title = "Race")
+```
+
+On observe des différences de survie selon la race, avec notamment une survie moins favorable pour les patientes afro-américaines. Ces disparités reflètent des inégalités d'accès aux soins et une prévalence plus élevée de sous-types tumoraux agressifs dans certaines populations.
+
+## Facteur ménopause
+
+```{r facteurs_menopause}
+df_meno <- mutate(df,
+  status = ifelse(vital_status == "Dead", 1, 0),
+  time_months = ifelse(vital_status == "Dead",
+                       as.numeric(death_days_to),
+                       as.numeric(last_contact_days_to)) / 30.4,
+  menopause_groupe = case_when(
+    menopause_status %in% c("[Not Available]", "[Not Evaluated]", "[Unknown]") ~ NA_character_,
+    grepl("Pre",  menopause_status) ~ "Pre-menopausee",
+    grepl("Post", menopause_status) ~ "Post-menopausee",
+    grepl("Peri", menopause_status) ~ "Peri-menopausee",
+    TRUE ~ NA_character_
+  ))
+
+df_meno_1 <- filter(df_meno, !is.na(time_months), time_months > 0, !is.na(menopause_groupe))
+
+km_meno <- survfit(Surv(time_months, status) ~ menopause_groupe, data = df_meno_1)
+
+ggsurvplot(km_meno, data = df_meno_1,
+           xlab = "Temps en mois", ylab = "Probabilité de survie",
+           pval = TRUE,
+           palette = c("purple", "orange", "green"),
+           legend.labs = c("Péri-ménopausée", "Post-ménopausée", "Pré-ménopausée"),
+           ggtheme = theme_minimal())
+```
+
+Les courbes montrent des différences de survie selon le statut ménopausique. Les patientes pré-ménopausées tendent à avoir une évolution différente, ce qui est cohérent avec le lien connu entre hormones et certains sous-types de cancer du sein.
+
+## Modèle de Cox multivarié
+
+Les analyses Kaplan-Meier précédentes ont permis d'identifier plusieurs facteurs associés à la survie, mais chacun a été étudié séparément. Le modèle de Cox permet de tester tous ces facteurs simultanément, en contrôlant l'effet des uns par rapport aux autres.
+
+```{r cox}
+df_cox <- df %>%
+  mutate(
+    age = as.numeric(age_at_diagnosis),
+    er = ifelse(er_status_by_ihc == "Positive", 1, 
+         ifelse(er_status_by_ihc == "Negative", 0, NA)),
+    her2 = ifelse(her2_status_by_ihc == "Positive", 1,
+           ifelse(her2_status_by_ihc == "Negative", 0, NA)),
+    stade = case_when(
+      grepl("Stage I", ajcc_pathologic_tumor_stage) & !grepl("II|III|IV", ajcc_pathologic_tumor_stage) ~ 1,
+      grepl("Stage II", ajcc_pathologic_tumor_stage) ~ 2,
+      grepl("Stage III", ajcc_pathologic_tumor_stage) ~ 3,
+      grepl("Stage IV", ajcc_pathologic_tumor_stage) ~ 4,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  filter(!is.na(age), !is.na(er), !is.na(her2), !is.na(stade))
+
+cox_model <- coxph(Surv(time_months, status) ~ age + er + her2 + stade, data = df_cox)
+summary(cox_model)
+```
+
+Le modèle confirme que l'âge (p \< 0.001), le statut ER (p = 0.046) et le statut HER2 (p = 0.037) sont des facteurs pronostiques indépendants. Le stade n'est plus significatif une fois les autres variables contrôlées, ce qui suggère que son effet passe en partie par les marqueurs moléculaires. La concordance de 0.82 indique un bon pouvoir prédictif du modèle.
+
+## Conclusion
+
+Cette analyse de survie sur la cohorte TCGA-BRCA (n = 1035 patientes) a permis d'identifier plusieurs facteurs influençant le pronostic du cancer du sein.
+
+La survie globale est favorable, avec une médiane de survie d'environ 125 mois (\~10 ans). L'exploration par facteurs révèle que le stade tumoral au diagnostic, le statut HER2, le statut ER et l'âge sont les principaux déterminants de la survie. Le modèle de Cox multivarié confirme que l'âge, le statut ER et HER2 restent des facteurs pronostiques indépendants après contrôle mutuel.
+
+Ces résultats sont cohérents avec la littérature médicale et illustrent l'intérêt des méthodes d'analyse de survie pour mieux comprendre le pronostic des patientes atteintes d'un cancer du sein.
